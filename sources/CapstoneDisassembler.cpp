@@ -1,65 +1,70 @@
 //
 // Created by steve on 7/5/17.
 //
-#include "headers/CapstoneDisassembler.hpp"
+#include "polyhook2/CapstoneDisassembler.hpp"
+
+PLH::CapstoneDisassembler::CapstoneDisassembler(const PLH::Mode mode) : ADisassembler(mode) {
+	const cs_mode csMode = (mode == PLH::Mode::x64 ? CS_MODE_64 : CS_MODE_32);
+	if (cs_open(CS_ARCH_X86, csMode, &m_capHandle) != CS_ERR_OK) {
+		m_capHandle = NULL;
+		Log::log("Failed to initialize capstone", ErrorLevel::SEV);
+	}
+
+	cs_option(m_capHandle, CS_OPT_DETAIL, CS_OPT_ON);
+}
+
+PLH::CapstoneDisassembler::~CapstoneDisassembler() {
+	if (m_capHandle)
+		cs_close(&m_capHandle);
+	m_capHandle = NULL;
+}
 
 PLH::insts_t
-PLH::CapstoneDisassembler::disassemble(uint64_t firstInstruction, uint64_t start, uint64_t End) {
-	cs_insn* InsInfo = cs_malloc(m_capHandle);
-	insts_t InsVec;
+PLH::CapstoneDisassembler::disassemble(uint64_t firstInstruction, uint64_t start, uint64_t End, const MemAccessor& accessor) {
+	cs_insn* insInfo = cs_malloc(m_capHandle);
+	insts_t insVec;
 	m_branchMap.clear();
 
-	uint64_t Size = End - start;
-	while (cs_disasm_iter(m_capHandle, (const uint8_t**)&firstInstruction, (size_t*)&Size, &start, InsInfo)) {
+	uint64_t size = End - start;
+	assert(size > 0);
+	if (size <= 0)
+		return insVec;
+
+	// copy potentially remote memory to local buffer
+	uint8_t* buf = new uint8_t[(uint32_t)size];
+
+	// bufAddr updated by cs_disasm_iter
+	uint64_t bufAddr = (uint64_t)buf;
+	accessor.mem_copy((uint64_t)buf, firstInstruction, size);
+
+	while (cs_disasm_iter(m_capHandle, (const uint8_t**)&bufAddr, (size_t*)&size, &start, insInfo)) {
 		// Set later by 'SetDisplacementFields'
-		Instruction::Displacement displacement;
+		Instruction::Displacement displacement = {};
 		displacement.Absolute = 0;
 
-		Instruction Inst(InsInfo->address,
+		Instruction inst(insInfo->address,
 						 displacement,
 						 0,
 						 false,
-						 InsInfo->bytes,
-						 InsInfo->size,
-						 InsInfo->mnemonic,
-						 InsInfo->op_str,
+			             false,
+						 insInfo->bytes,
+						 insInfo->size,
+						 insInfo->mnemonic,
+						 insInfo->op_str,
 						 m_mode);
 
-		setDisplacementFields(Inst, InsInfo);
-		InsVec.push_back(Inst);
+		setDisplacementFields(inst, insInfo);
+		insVec.push_back(inst);
 
-		// update jump map if the instruction is jump/call
-		if (Inst.isBranching() && Inst.hasDisplacement()) {
-			// search back, check if new instruction points to older ones (one to one)
-			auto destInst = std::find_if(InsVec.begin(), InsVec.end(), [=] (const Instruction& oldIns) {
-				return oldIns.getAddress() == Inst.getDestination();
-			});
+		// searches instruction vector and updates references
+		addToBranchMap(insVec, inst);
 
-			if (destInst != InsVec.end()) {
-				updateBranchMap(destInst->getAddress(), Inst);
-			}
-		}
-
-		// search forward, check if old instructions now point to new one (many to one possible)
-		for (const Instruction& oldInst : InsVec) {
-			if (oldInst.isBranching() && oldInst.hasDisplacement() && oldInst.getDestination() == Inst.getAddress()) {
-				updateBranchMap(Inst.getAddress(), oldInst);
-			}
-		}
+		if (isFuncEnd(inst))
+			break;
 	}
-	cs_free(InsInfo, 1);
-	return InsVec;
-}
-
-/**Write the raw bytes of the given instruction into the memory specified by the
- * instruction's address. If the address value of the instruction has been changed
- * since the time it was decoded this will copy the instruction to a new memory address.
- * This will not automatically do any code relocation, all relocation logic should
- * first modify the byte array, and then call write encoding, proper order to relocate
- * an instruction should be disasm instructions -> set relative/absolute displacement() ->
- * writeEncoding(). It is done this way so that these operations can be made transactional**/
-void PLH::CapstoneDisassembler::writeEncoding(const PLH::Instruction& instruction) const {
-	memcpy((void*)instruction.getAddress(), &instruction.getBytes()[0], instruction.size());
+	delete[] buf;
+	cs_free(insInfo, 1);
+	return insVec;
 }
 
 /**If an instruction is a jmp/call variant type this will set it's displacement fields to the
@@ -69,7 +74,7 @@ void PLH::CapstoneDisassembler::writeEncoding(const PLH::Instruction& instructio
  * the instruction pointer, or directly to an absolute address**/
 void PLH::CapstoneDisassembler::setDisplacementFields(PLH::Instruction& inst, const cs_insn* capInst) const {
 	cs_x86 x86 = capInst->detail->x86;
-	bool branches = hasGroup(capInst, x86_insn_group::X86_GRP_JUMP) || hasGroup(capInst, x86_insn_group::X86_GRP_CALL);
+	const bool branches = hasGroup(capInst, x86_insn_group::X86_GRP_JUMP) || hasGroup(capInst, x86_insn_group::X86_GRP_CALL);
 	inst.setBranching(branches);
 
 	for (uint_fast32_t j = 0; j < x86.op_count; j++) {
@@ -77,38 +82,58 @@ void PLH::CapstoneDisassembler::setDisplacementFields(PLH::Instruction& inst, co
 		if (op.type == X86_OP_MEM) {
 			// Are we relative to instruction pointer?
 			// mem are types like jmp [rip + 0x4] where location is dereference-d
-			if (op.mem.base != getIpReg()) {
-				if (hasGroup(capInst, x86_insn_group::X86_GRP_JUMP) && inst.getBytes().at(0) == 0xff && inst.getBytes().at(1) == 0x25) {
-					// far jmp 0xff, 0x25, holder jmp [0xdeadbeef]
-					inst.setAbsoluteDisplacement(*(uint32_t*)op.mem.disp);
+
+			bool needsDisplacement = false;
+			if ((hasGroup(capInst, x86_insn_group::X86_GRP_JUMP) && inst.size() >= 2 && inst.getBytes().at(0) == 0xff && inst.getBytes().at(1) == 0x25) ||
+				(hasGroup(capInst, x86_insn_group::X86_GRP_CALL) && inst.size() >= 2 && inst.getBytes().at(0) == 0xff && inst.getBytes().at(1) == 0x15) ||
+
+				// skip rex prefix
+			    (hasGroup(capInst, x86_insn_group::X86_GRP_JUMP) && inst.size() >= 3 && inst.getBytes().at(1) == 0xff && inst.getBytes().at(2) == 0x25) ||
+				(hasGroup(capInst, x86_insn_group::X86_GRP_CALL) && inst.size() >= 3 && inst.getBytes().at(1) == 0xff && inst.getBytes().at(2) == 0x25)
+				)
+			{
+				// far jmp 0xff, 0x25, holder jmp [0xdeadbeef]
+				inst.setIndirect(true);
+
+				if (m_mode == Mode::x86) {
+					needsDisplacement = true;
 				}
-				continue;
+			} 
+
+			if (op.mem.base == getIpReg()) {
+				const uint8_t offset = x86.encoding.disp_offset;
+				const uint8_t size = std::min<uint8_t>(x86.encoding.disp_size,
+					std::min<uint8_t>(sizeof(uint64_t), (uint8_t)(capInst->size - x86.encoding.disp_offset)));
+
+				// it's relative, set immDest to max to trigger later check
+				copyDispSx(inst, offset, size, std::numeric_limits<int64_t>::max());
+			} else if (needsDisplacement) {
+				const uint8_t offset = x86.encoding.disp_offset;
+				const uint8_t size = std::min<uint8_t>(x86.encoding.disp_size,
+					std::min<uint8_t>(sizeof(uint64_t), (uint8_t)(capInst->size - x86.encoding.disp_offset)));
+
+				// it's absolute
+				copyDispSx(inst, offset, size, op.mem.disp);
 			}
 
-			const uint8_t Offset = x86.encoding.disp_offset;
-			const uint8_t Size = std::min<uint8_t>(x86.encoding.disp_size,
-												   std::min<uint8_t>(sizeof(uint64_t), (uint8_t)(capInst->size - x86.encoding.disp_offset)));
-
-			// it's relative, set immDest to max to trigger later check
-			copyDispSX(inst, Offset, Size, std::numeric_limits<int64_t>::max());
 			break;
 		} else if (op.type == X86_OP_IMM) {
 			// IMM types are like call 0xdeadbeef where they jmp straight to some location
 			if (!branches)
 				break;
 
-			const uint8_t Offset = x86.encoding.imm_offset;
-			const uint8_t Size = std::min<uint8_t>(x86.encoding.imm_size,
+			const uint8_t offset = x86.encoding.imm_offset;
+			const uint8_t size = std::min<uint8_t>(x86.encoding.imm_size,
 												   std::min<uint8_t>(sizeof(uint64_t), (uint8_t)(capInst->size - x86.encoding.imm_offset)));
 
-			copyDispSX(inst, Offset, Size, op.imm);
+			copyDispSx(inst, offset, size, op.imm);
 			break;
 		}
 	}
 }
 
 /**Copies the displacement bytes from memory, and sign extends these values if necessary**/
-void PLH::CapstoneDisassembler::copyDispSX(PLH::Instruction& inst,
+void PLH::CapstoneDisassembler::copyDispSx(PLH::Instruction& inst,
 										   const uint8_t offset,
 										   const uint8_t size,
 										   const int64_t immDestination) const {
@@ -128,7 +153,7 @@ void PLH::CapstoneDisassembler::copyDispSX(PLH::Instruction& inst,
 	assert(offset + size <= (uint8_t)inst.getBytes().size());
 	memcpy(&displacement, &inst.getBytes()[offset], size);
 
-	uint64_t mask = (1ULL << (size * 8 - 1));
+	const uint64_t mask = (1ULL << (size * 8 - 1));
 	if (displacement & (1ULL << (size * 8 - 1))) {
 		/* sign extend if negative, requires that bits above Size*8 are zero,
 		 * if bits are not zero use x = x & ((1U << b) - 1) where x is a temp for displacement
@@ -149,42 +174,4 @@ void PLH::CapstoneDisassembler::copyDispSX(PLH::Instruction& inst,
 		assert(((uint64_t)displacement) == ((uint64_t)immDestination));
 		inst.setAbsoluteDisplacement((uint64_t)displacement);
 	}
-}
-
-bool PLH::CapstoneDisassembler::isConditionalJump(const PLH::Instruction& instruction) const {
-	// http://unixwiz.net/techtips/x86-jumps.html
-	if (instruction.size() < 1)
-		return false;
-
-	std::vector<uint8_t> bytes = instruction.getBytes();
-	if (bytes[0] == 0x0F && instruction.size() > 1) {
-		if (bytes[1] >= 0x80 && bytes[1] <= 0x8F)
-			return true;
-	}
-
-	if (bytes[0] >= 0x70 && bytes[0] <= 0x7F)
-		return true;
-
-	if (bytes[0] == 0xE3)
-		return true;
-
-	return false;
-}
-
-bool PLH::CapstoneDisassembler::isFuncEnd(const PLH::Instruction& instruction) const {
-	// TODO: more?
-	/*
-	* 0xABABABAB : Used by Microsoft's HeapAlloc() to mark "no man's land" guard bytes after allocated heap memory
-	* 0xABADCAFE : A startup to this value to initialize all free memory to catch errant pointers
-	* 0xBAADF00D : Used by Microsoft's LocalAlloc(LMEM_FIXED) to mark uninitialised allocated heap memory
-	* 0xBADCAB1E : Error Code returned to the Microsoft eVC debugger when connection is severed to the debugger
-	* 0xBEEFCACE : Used by Microsoft .NET as a magic number in resource files
-	* 0xCCCCCCCC : Used by Microsoft's C++ debugging runtime library to mark uninitialised stack memory
-	* 0xCDCDCDCD : Used by Microsoft's C++ debugging runtime library to mark uninitialised heap memory
-	* 0xDDDDDDDD : Used by Microsoft's C++ debugging heap to mark freed heap memory
-	* 0xDEADDEAD : A Microsoft Windows STOP Error code used when the user manually initiates the crash.
-	* 0xFDFDFDFD : Used by Microsoft's C++ debugging heap to mark "no man's land" guard bytes before and after allocated heap memory
-	* 0xFEEEFEEE : Used by Microsoft's HeapFree() to mark freed heap memory
-	*/
-	return instruction.getMnemonic() == "ret";
 }

@@ -5,22 +5,51 @@ Article 1: https://www.codeproject.com/articles/1100579/polyhook-the-cplusplus-x
 
 Article 2: https://www.codeproject.com/Articles/1252212/PolyHook-2-Cplusplus17-x86-x64-Hooking-Library
 
-# Build
-```
-git clone --recursive https://github.com/stevemk14ebr/PolyHook_2_0.git
-git submodule update --init --recursive
-```
-Then run buildcapstone.bat and open this in VS2017 now that it has cmake support. Or generate a cmake project with 
-```cmake -G```. I recommend VS2017 very much.
+# Community
+Ask for help, chat with others, talk to me here
+* [Official Gitter Chat](https://gitter.im/PolyHook/Lobby)
+* Please consider sponsoring my work by clicking sponsor up in the top right
 
-You can build 3 different things. By default an executable is built and the unit tests are run. You can also build as a library by setting the ```BUILD_DLL``` option in CMakeLists.txt. If you choose to build as a library you can build it for static linking using the ```BUILD_STATIC``` option. I've setup an example project to show how to use this as a static library. You should clear your cmake cache between changing these options. The dll is built with the cmake option to export all symbols. This is different from the typical windows DLL where things are manually exported via declspec(dllexport), instead it behaves how linux dlls do with all symbols exported by default. This style should make it easier to maintain the code, the downside is there are many exports but i don't care.
+# Packaging
+PolyHook2 is available on vcpkg. Consider trying that installation method if you prefer. Just install vcpkg from microsofts directions: 
 
-Read the tests for docs for now until i write some. They are extensive
+Commands: 
+```
+λ git clone https://github.com/Microsoft/vcpkg.git
+λ cd vcpkg
+λ .\bootstrap-vcpkg.bat -disableMetrics
+λ (as admin) .\vcpkg integrate install
+λ vcpkg.exe install polyhook2
+```
+You then simply include the polyhook headers, be sure to link the generated .lib.
+
+# Build Manually
+See: https://github.com/stevemk14ebr/PolyHook_2_0/pull/59#issuecomment-619223616
+```
+λ git clone --recursive https://github.com/stevemk14ebr/PolyHook_2_0.git
+λ cd PolyHook_2_0
+λ git submodule update --init --recursive
+λ cmake -B"./_build" -DCMAKE_INSTALL_PREFIX="./_install/" -DPOLYHOOK_BUILD_SHARED_LIB=ON
+λ cmake --build "./_build" --config Release --target INSTALL
+```
+I provide directions below for how to setup the visual studio cmake environment only. If you don't want to use visual studio that's fine, this is a standard cmake project and will build from command line just fine. 
+
+### Visual Studio 2017/2019
+clone the project and perform submodule init as above. Do not run the cmake commands, instead:
+
+Open VS 2017, go to file->open->cmake.. this will load the project and start cmake generation. Next goto cmake->build all or cmake->build, you can also set a startup item and release mode to use the play button (do not use the install target). Capstone, Zydis, and asmjit are set to automatically build and link, you DO NOT need to build them seperately.
+
+### Documentation
+https://stevemk14ebr.github.io/PolyHook_2_0/ & Read the Tests!
+
+I've setup an example project to show how to use this as a static library. You should clear your cmake cache between changing these options. The dll is built with the cmake option to export all symbols. This is different from the typical windows DLL where things are manually exported via declspec(dllexport), instead it behaves how linux dlls do with all symbols exported by default. This style should make it easier to maintain the code, the downside is there are many exports but i don't care.
 
 # Features
+0) Both capstone and zydis are supported as disassembly backends and are fully abstracted
 1) Inline hook (x86/x64 Detour)
     - Places a jmp to a callback at the prologue, and then allocates a trampoline to continue execution of the original function
     - Operates entirely on an intermediate instruction object, disassembler engine is swappable, capstone included by default
+    - Can JIT callback for when calling conv is unknown at compile time (see ILCallback.cpp)
     - Follows already hooked functions
     - Resolves indirect calls such as through the iat and hooks underlying function
     - Relocates prologue and resolves all position dependent code
@@ -29,17 +58,22 @@ Read the tests for docs for now until i write some. They are extensive
       - Relocations inside the moved section are resolved (not using relocation table, disassembles using engine)
     - x64 trampoline is not restricted to +- 2GB, can be anywhere, avoids shadow space + no registers spoiled
     - If inline hook fails at an intermediate step the original function will not be malformed. All writes are batched until after we know later steps succeed.
+    
+ 2) Runtime Inline Hook
+    - All the goodness of normal inline hooks, but JIT's a translation stub compatible with the given typedef and ABI. The translation stub will move arguments into a small struct, which is passed as pointer to a callback and allow the spoofing of return value. This allows tools to generate hook translation stubs at runtime, allowing for the full inline hooking of functions where the typedef is not known until runtime.
 
-2) Virtual Function Swap (VFuncSwap)
+3) Virtual Function Swap (VFuncSwap)
     * Swaps the pointers at given indexs in a C++ VTable to point to a callbacks
-3) Virtual Table Swap (VTableSwap)
+4) Virtual Table Swap (VTableSwap)
     * Performs a deep copy on a c++ VTable and replaces the pointer to the table with the newly allocated copy. Then swaps the pointer entries in the copy to point to callbacks
-4) Software Breakpoint Hook (BreakpointHook)
+5) Software Breakpoint Hook (BreakpointHook)
     * Overwrites the first byte of a function with 0xCC and calls the callback in the exception handler. Provides the user with an automatic method to restore the original overwritten byte
-5) Hardware Breakpoint Hook (HWBreakpointHook)
-   * Sets the debug registers of the CPU to add a HW execution BP for the calling thread. The callback is called in the exception handler. Remember HW BP's are per thread, calling thread determines which thread bp is for
-6) Import Address Table Hook (IatHook)
+6) Hardware Breakpoint Hook (HWBreakpointHook)
+   * Sets the debug registers of the CPU to add a HW execution BP for the calling thread. The callback is called in the exception handler. **Remember HW BP's are per thread, the thread calling hook() must be the same as the one that is being hooked. You may find a quick detour, then setting up the HWBP in the detour callback, then unhooking to be a useful construct.**
+7) Import Address Table Hook (IatHook)
     * Resolves loaded modules through PEB, finds IAT, then swaps the thunk pointer to the callback. 
+8) Export Address Table Hook (EatHook)
+    * Resolves loaded modules through PEB, finds EAT, then swaps pointer to export to the callback. Since this is a 32bit offset we optionally allocate a trampoline stub to do the full transfer to callback if it's beyond 32bits.
     
 # Extras
 - THOROUGHLY unit tested, hundreds of tests, using the fantastic library Catch
@@ -52,16 +86,13 @@ Read the tests for docs for now until i write some. They are extensive
 # Future
 Linux support
 
-# Donate
-Running Total: $40
-
-[![Support via PayPal](https://cdn.rawgit.com/twolfson/paypal-github-button/1.0.0/dist/button.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=M2K8DQUNDUGMW&lc=US&item_name=PolyHook%20Donation&currency_code=USD&bn=PP%2dDonationsBF%3abtn_donateCC_LG%2egif%3aNonHosted)
-
 # License
 MIT - Please consider donating
 
 # Resource &/| references
 evolution536, DarthTon, IChooseYou on Unknowncheats.me
+
+@Ochii & https://www.unknowncheats.me/forum/c-and-c/50426-eat-hooking-dlls.html for EAT implementation
 
 https://github.com/DarthTon/Blackbone
 

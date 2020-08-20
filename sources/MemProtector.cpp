@@ -1,8 +1,7 @@
-#include "headers/MemProtector.hpp"
-#include "headers/Enums.hpp"
+#include "polyhook2/MemProtector.hpp"
+#include "polyhook2/Enums.hpp"
 
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
+#include <windows.h>
 
 PLH::ProtFlag operator|(PLH::ProtFlag lhs, PLH::ProtFlag rhs) {
 	return static_cast<PLH::ProtFlag>(
